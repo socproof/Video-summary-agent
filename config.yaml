@@ -1,0 +1,23 @@
+# config.yaml
+model:
+  name: "llama3:8b"  # Доступные: mistral, llama2, mixtral, gemma, deepseek-r1
+  temperature: 0.1
+  num_ctx: 8192
+  timeout: 60
+
+processing:
+  chunk_size: 4000           # Размер чанка для LLM
+  min_topic_duration: 30     # Минимальная длина темы (сек)
+  max_topic_duration: 300    # Максимальная длина темы (сек)
+  pause_threshold: 10        # Порог паузы для разбиения (сек)
+  use_llm: true
+  chunk_lines: 100
+
+paths:
+  input_dir: "transcripts"
+  output_dir: "results"
+
+output:
+  format: "csv"
+  encoding: "utf-8-sig"
+  delimiter: ";"
