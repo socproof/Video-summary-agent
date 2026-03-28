@@ -1,12 +1,11 @@
 import re
-import csv
 import yaml
 import json
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Optional
 from dataclasses import dataclass
-import time
-import requests
+import openpyxl
+from openpyxl.styles import Font, Alignment, PatternFill
 
 from langchain_ollama import OllamaLLM
 from langchain_core.prompts import PromptTemplate
@@ -14,7 +13,6 @@ from langchain_core.prompts import PromptTemplate
 
 @dataclass
 class TranscriptLine:
-    """Строка транскрипции"""
     start_time: float
     end_time: float
     text: str
@@ -22,17 +20,13 @@ class TranscriptLine:
 
 @dataclass
 class Topic:
-    """Тема с временными рамками"""
     number: int
     start_time: str
-    end_time: str
     summary: str
-    full_text: str
 
 
 class Config:
     """Управление конфигурацией"""
-
     def __init__(self, config_path: str = "config.yaml"):
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
@@ -43,25 +37,15 @@ class Config:
 
     def _default_config(self):
         return {
-            'model': {
-                'name': 'mistral',
-                'temperature': 0.1,
-                'num_ctx': 8192,
-                'timeout': 30,
-                'base_url': 'http://localhost:11434'
-            },
+            'model': {'name': 'mistral', 'temperature': 0.3, 'num_ctx': 8192, 'timeout': 60},
             'processing': {
-                'chunk_lines': 100,
+                'pause_threshold': 8,
                 'min_topic_duration': 30,
                 'max_topic_duration': 300,
-                'pause_threshold': 10,
-                'use_llm': True,
-                'debug': True
+                'use_llm': True
             },
-            'paths': {
-                'input_dir': 'transcripts',
-                'output_dir': 'results'
-            }
+            'paths': {'input_dir': 'transcripts', 'output_dir': 'results'},
+            'output': {'format': 'xlsx'}
         }
 
     def get(self, *keys, default=None):
@@ -77,115 +61,65 @@ class Config:
 
 
 class TranscriptAnalyzer:
-    """Анализатор транскрипций"""
+    """Гибридный анализатор: сегментация по паузам + батч-анализ через LLM"""
 
     def __init__(self, config_path: str = "config.yaml"):
         self.config = Config(config_path)
-        self.debug = self.config.get('processing', 'debug', default=True)
-
-        # Параметры обработки
-        self.chunk_lines = self.config.get('processing', 'chunk_lines', default=100)
+        self.pause_threshold = self.config.get('processing', 'pause_threshold', default=8)
         self.min_duration = self.config.get('processing', 'min_topic_duration', default=30)
         self.max_duration = self.config.get('processing', 'max_topic_duration', default=300)
-        self.pause_threshold = self.config.get('processing', 'pause_threshold', default=10)
         self.use_llm = self.config.get('processing', 'use_llm', default=True)
-        self.llm_timeout = self.config.get('model', 'timeout', default=30)
-        self.base_url = self.config.get('model', 'base_url', default='http://localhost:11434')
 
-        # Проверка доступности Ollama
-        self._check_ollama_connection()
-
-        # Инициализация LLM
-        self.llm = None
-        if self.use_llm:
-            self._init_llm()
-
-        self._init_prompts()
-
-    def _check_ollama_connection(self):
-        """Проверка подключения к Ollama"""
-        print(f"🔍 Проверка подключения к Ollama ({self.base_url})...")
-
-        try:
-            response = requests.get(f"{self.base_url}/api/tags", timeout=5)
-            if response.status_code == 200:
-                models = response.json().get('models', [])
-                print(f"  ✓ Ollama доступен, найдено моделей: {len(models)}")
-
-                model_name = self.config.get('model', 'name', default='mistral')
-                model_found = any(m['name'].startswith(model_name) for m in models)
-
-                if model_found:
-                    print(f"  ✓ Модель '{model_name}' найдена")
-                else:
-                    print(f"  ⚠️  Модель '{model_name}' не найдена!")
-                    print(f"  Доступные модели: {[m['name'] for m in models]}")
-
-                return True
-            else:
-                print(f"  ✗ Ollama вернул код {response.status_code}")
-                return False
-
-        except requests.exceptions.ConnectionError:
-            print(f"  ✗ Не удалось подключиться к Ollama!")
-            print(f"  Убедитесь, что Ollama запущен: ollama serve")
-            return False
-        except Exception as e:
-            print(f"  ✗ Ошибка: {e}")
-            return False
+        print(f"🤖 Инициализация LLM...")
+        self._init_llm()
+        self._init_prompt()
 
     def _init_llm(self):
         """Инициализация LLM"""
+        if not self.use_llm:
+            self.llm = None
+            return
+
         try:
             model_name = self.config.get('model', 'name', default='mistral')
-            print(f"🤖 Инициализация LLM (модель: {model_name})...")
+            base_url = self.config.get('model', 'base_url', default='http://localhost:11434')
+
+            print(f"  Модель: {model_name}")
 
             self.llm = OllamaLLM(
                 model=model_name,
-                base_url=self.base_url,
-                temperature=self.config.get('model', 'temperature', default=0.1),
-                num_ctx=self.config.get('model', 'num_ctx', default=8192),
+                base_url=base_url,
+                temperature=self.config.get('model', 'temperature', default=0.3),
+                num_ctx=self.config.get('model', 'num_ctx', default=8192)
             )
-
-            # Тестовый запрос
-            print("  Тестовый запрос к LLM...", end=' ')
-            start = time.time()
-            test_response = self.llm.invoke("Привет, ответь одним словом")
-            elapsed = time.time() - start
-            print(f"✓ ({elapsed:.2f}s)")
-
-            if self.debug:
-                print(f"  Ответ LLM: {test_response[:100]}")
-
+            print(f"  ✓ LLM готов")
         except Exception as e:
-            print(f"  ✗ Ошибка инициализации LLM: {e}")
+            print(f"  ✗ Ошибка LLM: {e}")
             self.llm = None
-            self.use_llm = False
 
-    def _init_prompts(self):
-        """Инициализация промптов"""
+    def _init_prompt(self):
+        """Инициализация промпта для батч-анализа"""
+        self.batch_prompt = PromptTemplate(
+            input_variables=["segments"],
+            template="""Для каждого пронумерованного сегмента транскрипции сформулируй ОДНУ ГЛАВНУЮ ТЕМУ или КЛЮЧЕВОЙ ВОПРОС.
 
-        self.segmentation_prompt = PromptTemplate(
-            input_variables=["text"],
-            template="""Раздели транскрипцию на смысловые темы.
+Требования к каждому описанию:
+- Одно короткое предложение (5-15 слов)
+- Суть темы или главный вопрос
+- БЕЗ вводных слов "обсуждается", "говорится", "речь идёт"
+- Конкретно и понятно
 
-ТРАНСКРИПЦИЯ:
-{text}
+СЕГМЕНТЫ:
+{segments}
 
-Верни JSON массив с темами. Для каждой укажи начало и конец в секундах:
-[{{"start": секунды, "end": секунды}}]
+Верни ТОЛЬКО JSON массив в формате:
+[
+  {{"segment": 1, "topic": "Краткое описание темы 1"}},
+  {{"segment": 2, "topic": "Краткое описание темы 2"}},
+  ...
+]
 
-ТОЛЬКО JSON массив:"""
-        )
-
-        self.summary_prompt = PromptTemplate(
-            input_variables=["text"],
-            template="""Кратко опиши тему одним предложением (15-25 слов).
-
-ТЕКСТ:
-{text}
-
-КРАТКОЕ ОПИСАНИЕ:"""
+JSON:"""
         )
 
     def parse_transcript(self, file_path: Path) -> List[TranscriptLine]:
@@ -200,12 +134,11 @@ class TranscriptAnalyzer:
         ]
 
         with open(file_path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
+            for line in f:
                 line = line.strip()
                 if not line:
                     continue
 
-                parsed = False
                 for pattern in patterns:
                     match = re.match(pattern, line)
                     if match:
@@ -215,302 +148,230 @@ class TranscriptAnalyzer:
                             end_time=float(groups[1]),
                             text=groups[2].strip()
                         ))
-                        parsed = True
                         break
 
-                if not parsed and self.debug and line_num <= 3:
-                    print(f"  ⚠️  Не удалось распарсить строку {line_num}: {line[:50]}")
-
-        if self.debug and lines:
-            print(f"  Первая строка: {lines[0].start_time}-{lines[0].end_time}: {lines[0].text[:50]}")
-            print(f"  Последняя строка: {lines[-1].start_time}-{lines[-1].end_time}: {lines[-1].text[:50]}")
-
+        print(f"  ✓ Прочитано строк: {len(lines)}")
         return lines
 
-    def segment_by_rules(self, lines: List[TranscriptLine]) -> List[Dict]:
-        """Разбиение на темы по эвристическим правилам"""
-        if self.debug:
-            print(f"  📐 Применение эвристических правил...")
-
-        segments = []
-        current_segment = []
-
-        for i, line in enumerate(lines):
-            current_segment.append(line)
-
-            should_break = False
-
-            if i < len(lines) - 1:
-                next_line = lines[i + 1]
-                pause = next_line.start_time - line.end_time
-
-                if pause > self.pause_threshold:
-                    should_break = True
-                    if self.debug:
-                        print(f"    Большая пауза: {pause:.1f}s")
-
-                segment_duration = line.end_time - current_segment[0].start_time
-                if segment_duration > self.max_duration:
-                    should_break = True
-                    if self.debug:
-                        print(f"    Макс. длительность: {segment_duration:.1f}s")
-            else:
-                should_break = True
-
-            if should_break and current_segment:
-                duration = current_segment[-1].end_time - current_segment[0].start_time
-
-                if duration >= self.min_duration:
-                    text = ' '.join([l.text for l in current_segment])
-                    segments.append({
-                        'start': current_segment[0].start_time,
-                        'end': current_segment[-1].end_time,
-                        'text': text
-                    })
-                    if self.debug:
-                        print(f"    ✓ Сегмент {len(segments)}: {duration:.1f}s, {len(current_segment)} строк")
-
-                current_segment = []
-
-        return segments
-
-    def segment_with_llm(self, lines: List[TranscriptLine]) -> List[Dict]:
-        """Разбиение на темы с помощью LLM"""
-        if not self.llm:
-            print("  ⚠️  LLM не инициализирован")
-            return None
-
-        chunks = []
-        for i in range(0, len(lines), self.chunk_lines):
-            chunk = lines[i:i + self.chunk_lines]
-            chunks.append(chunk)
-
-        print(f"  📦 Разбито на {len(chunks)} чанков по ~{self.chunk_lines} строк")
-
-        all_segments = []
-
-        for chunk_idx, chunk in enumerate(chunks):
-            print(f"  🔄 Чанк {chunk_idx + 1}/{len(chunks)}:", end=' ')
-
-            # Сначала правила
-            chunk_segments = self.segment_by_rules(chunk)
-
-            if not chunk_segments:
-                print("пусто")
-                continue
-
-            print(f"правила дали {len(chunk_segments)} сегментов", end=', ')
-
-            # Пробуем LLM
-            try:
-                sample_lines = chunk[:50]
-                text_lines = [
-                    f"{line.start_time}-{line.end_time}: {line.text}"
-                    for line in sample_lines
-                ]
-                chunk_text = '\n'.join(text_lines)
-
-                if self.debug:
-                    print(f"\n    📝 Текст для LLM ({len(chunk_text)} символов):")
-                    print(f"    {chunk_text[:200]}...")
-
-                prompt = self.segmentation_prompt.format(text=chunk_text)
-
-                print("отправка в LLM...", end=' ')
-                start_time = time.time()
-
-                response = self.llm.invoke(prompt)
-
-                elapsed = time.time() - start_time
-                print(f"получен ответ за {elapsed:.1f}s", end=', ')
-
-                if self.debug:
-                    print(f"\n    🤖 Ответ LLM ({len(response)} символов):")
-                    print(f"    {response[:300]}...")
-
-                llm_segments = self._parse_json_response(response)
-
-                if llm_segments and len(llm_segments) > 0:
-                    print(f"LLM нашел {len(llm_segments)} тем ✓")
-
-                    for llm_seg in llm_segments:
-                        start = llm_seg.get('start', 0)
-                        end = llm_seg.get('end', 0)
-
-                        matching_lines = [
-                            l for l in chunk
-                            if l.start_time >= start and l.end_time <= end
-                        ]
-
-                        if matching_lines:
-                            all_segments.append({
-                                'start': matching_lines[0].start_time,
-                                'end': matching_lines[-1].end_time,
-                                'text': ' '.join([l.text for l in matching_lines])
-                            })
-                else:
-                    print("не удалось распарсить, используем правила")
-                    all_segments.extend(chunk_segments)
-
-            except Exception as e:
-                print(f"ошибка: {e}")
-                if self.debug:
-                    import traceback
-                    traceback.print_exc()
-                all_segments.extend(chunk_segments)
-
-        return all_segments if all_segments else None
-
-    def generate_summaries(self, topics: List[Dict]) -> List[Dict]:
-        """Генерация саммари для тем"""
-        print(f"  💭 Генерация саммари для {len(topics)} тем...")
-
-        for i, topic in enumerate(topics):
-            if (i + 1) % 5 == 0 or self.debug:
-                print(f"    {i + 1}/{len(topics)}...", end=' ')
-
-            text = topic['text'][:800]
-
-            if self.llm:
-                try:
-                    if self.debug:
-                        print(f"LLM запрос...", end=' ')
-
-                    start = time.time()
-                    prompt = self.summary_prompt.format(text=text)
-                    summary = self.llm.invoke(prompt).strip()
-                    elapsed = time.time() - start
-
-                    if self.debug:
-                        print(f"✓ ({elapsed:.1f}s)")
-
-                    if summary and len(summary) > 10:
-                        if len(summary) > 200:
-                            summary = summary[:197] + "..."
-                        topic['summary'] = summary
-                        continue
-                except Exception as e:
-                    if self.debug:
-                        print(f"ошибка: {e}")
-
-            topic['summary'] = self._generate_fallback_summary(text)
-            if self.debug:
-                print("fallback")
-
-        return topics
-
-    def _generate_fallback_summary(self, text: str) -> str:
-        """Простое саммари без LLM"""
-        text_lower = text.lower()
-
-        keywords = []
-        if any(word in text_lower for word in ['вопрос', '?']):
-            keywords.append('вопрос-ответ')
-        if any(word in text_lower for word in ['обсуждение', 'говорим', 'тема']):
-            keywords.append('обсуждение')
-        if any(word in text_lower for word in ['проблема', 'ситуация', 'кризис']):
-            keywords.append('проблемная ситуация')
-
-        if keywords:
-            summary = "Тема: " + ", ".join(keywords)
-        else:
-            words = [w for w in text.split() if len(w) > 3][:10]
-            summary = "Обсуждение: " + " ".join(words)
-
-        return summary[:150]
-
-    def analyze(self, lines: List[TranscriptLine]) -> List[Topic]:
-        """Основной метод анализа"""
+    def segment_by_pauses(self, lines: List[TranscriptLine]) -> List[List[TranscriptLine]]:
+        """Разбивка на сегменты по паузам с учётом min/max длительности"""
         if not lines:
             return []
 
-        print(f"  📊 Найдено строк: {len(lines)}")
-        total_duration = lines[-1].end_time - lines[0].start_time
-        print(f"  ⏱️  Общая длительность: {total_duration/60:.1f} минут")
+        raw_segments = []
+        current_segment = [lines[0]]
 
-        print("\n  🔍 Этап 1: Сегментация")
-        segments = None
+        # Первичная разбивка по паузам
+        for i in range(1, len(lines)):
+            pause = lines[i].start_time - lines[i-1].end_time
+            current_duration = lines[i-1].end_time - current_segment[0].start_time
 
-        if self.use_llm and self.llm:
-            try:
-                segments = self.segment_with_llm(lines)
-            except Exception as e:
-                print(f"  ✗ Ошибка LLM: {e}")
-                if self.debug:
-                    import traceback
-                    traceback.print_exc()
+            # Разбиваем если пауза большая ИЛИ превышена макс. длительность
+            if pause > self.pause_threshold or current_duration > self.max_duration:
+                raw_segments.append(current_segment)
+                current_segment = [lines[i]]
+            else:
+                current_segment.append(lines[i])
 
-        if not segments:
-            print("  📐 Fallback: используем только правила")
-            segments = self.segment_by_rules(lines)
+        if current_segment:
+            raw_segments.append(current_segment)
 
-        if not segments:
-            print("  ✗ Не удалось выделить сегменты")
-            return []
+        # Объединяем короткие сегменты
+        final_segments = []
+        i = 0
+        while i < len(raw_segments):
+            segment = raw_segments[i]
+            duration = segment[-1].end_time - segment[0].start_time
 
-        print(f"\n  ✓ Выделено сегментов: {len(segments)}")
+            # Если сегмент слишком короткий, пробуем объединить со следующим
+            if duration < self.min_duration and i + 1 < len(raw_segments):
+                next_segment = raw_segments[i + 1]
+                combined_duration = next_segment[-1].end_time - segment[0].start_time
 
-        print("\n  🔍 Этап 2: Генерация саммари")
-        segments = self.generate_summaries(segments)
+                # Объединяем если это не превысит макс. длительность
+                if combined_duration <= self.max_duration:
+                    segment.extend(next_segment)
+                    i += 2
+                else:
+                    final_segments.append(segment)
+                    i += 1
+            else:
+                final_segments.append(segment)
+                i += 1
 
-        topics = []
-        for i, seg in enumerate(segments, 1):
-            topics.append(Topic(
-                number=i,
-                start_time=self._format_time(seg['start']),
-                end_time=self._format_time(seg['end']),
-                summary=seg.get('summary', 'Тема не определена'),
-                full_text=seg['text']
-            ))
+        print(f"  ✓ Найдено сегментов: {len(final_segments)}")
+        print(f"    (min: {self.min_duration}s, max: {self.max_duration}s, пауза: {self.pause_threshold}s)")
+        return final_segments
 
-        return topics
+    def batch_analyze_segments(self, segments: List[List[TranscriptLine]]) -> List[str]:
+        """Батч-анализ всех сегментов одним запросом к LLM"""
+        if not self.llm:
+            print("  ✗ LLM не инициализирован, используем fallback")
+            return [self._fallback_summary(seg) for seg in segments]
 
-    def _parse_json_response(self, response: str) -> Optional[List[Dict]]:
+        print(f"  💭 Батч-анализ {len(segments)} сегментов через LLM...")
+
+        # Форматируем все сегменты для одного запроса
+        formatted_segments = []
+        for i, segment in enumerate(segments, 1):
+            text = ' '.join([line.text for line in segment])
+            # Ограничиваем каждый сегмент для экономии токенов
+            if len(text) > 800:
+                text = text[:800] + "..."
+
+            start_time = self._format_time(segment[0].start_time)
+            formatted_segments.append(f"Сегмент {i} [{start_time}]:\n{text}")
+
+        all_segments_text = "\n\n".join(formatted_segments)
+
+        # Проверяем размер
+        char_count = len(all_segments_text)
+        estimated_tokens = char_count // 4
+        print(f"    Размер батча: {char_count} символов (~{estimated_tokens} токенов)")
+
+        if estimated_tokens > self.config.get('model', 'num_ctx', default=8192) * 0.7:
+            print(f"    ⚠️  Батч большой, возможна обрезка. Рекомендуется увеличить num_ctx")
+
+        try:
+            prompt = self.batch_prompt.format(segments=all_segments_text)
+
+            print(f"    Ожидание ответа от LLM...")
+            import time
+            start = time.time()
+
+            response = self.llm.invoke(prompt)
+
+            elapsed = time.time() - start
+            print(f"    ✓ Получен ответ за {elapsed:.1f}s")
+
+            # Парсим JSON
+            summaries_data = self._parse_json_response(response)
+
+            if not summaries_data or len(summaries_data) != len(segments):
+                print(f"    ⚠️  Количество тем не совпадает ({len(summaries_data) if summaries_data else 0} != {len(segments)})")
+                print(f"    Используем fallback для недостающих")
+
+                summaries = []
+                for i in range(len(segments)):
+                    if summaries_data and i < len(summaries_data):
+                        summary = summaries_data[i].get('topic', '')
+                        if summary and len(summary) > 5:
+                            summaries.append(summary)
+                        else:
+                            summaries.append(self._fallback_summary(segments[i]))
+                    else:
+                        summaries.append(self._fallback_summary(segments[i]))
+
+                return summaries
+
+            # Извлекаем только тексты тем
+            summaries = [item.get('topic', 'Тема не определена') for item in summaries_data]
+            print(f"    ✓ Успешно обработано тем: {len(summaries)}")
+
+            return summaries
+
+        except Exception as e:
+            print(f"    ✗ Ошибка LLM: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"    Используем fallback для всех сегментов")
+            return [self._fallback_summary(seg) for seg in segments]
+
+    def _fallback_summary(self, segment: List[TranscriptLine]) -> str:
+        """Простое саммари без LLM"""
+        text = ' '.join([line.text for line in segment])
+        words = [w for w in text.split() if len(w) > 3][:12]
+        return ' '.join(words) if words else "Тема не определена"
+
+    def _parse_json_response(self, response: str) -> Optional[List[dict]]:
         """Парсинг JSON из ответа LLM"""
         try:
+            # Убираем markdown если есть
+            response = re.sub(r'```json\s*', '', response)
+            response = re.sub(r'```\s*', '', response)
             response = response.strip()
 
+            # Ищем JSON массив
             start = response.find('[')
             end = response.rfind(']') + 1
 
             if start != -1 and end > start:
                 json_str = response[start:end]
                 parsed = json.loads(json_str)
-                if self.debug:
-                    print(f"\n    ✓ JSON распарсен: {len(parsed)} элементов")
                 return parsed
 
+            # Пробуем парсить весь ответ
             return json.loads(response)
+
         except Exception as e:
-            if self.debug:
-                print(f"\n    ✗ Ошибка парсинга JSON: {e}")
+            print(f"    ✗ Ошибка парсинга JSON: {e}")
+            print(f"    Ответ LLM (первые 300 символов): {response[:300]}")
             return None
 
-    def _format_time(self, seconds: float) -> str:
-        """Форматирование времени MM:SS"""
-        m = int(seconds // 60)
-        s = int(seconds % 60)
-        return f"{m:02d}:{s:02d}"
+    def analyze(self, lines: List[TranscriptLine]) -> List[Topic]:
+        """Основной метод анализа"""
+        if not lines:
+            return []
 
-    def save_csv(self, topics: List[Topic], output_path: Path):
-        """Сохранение в CSV"""
+        print(f"  📊 Строк: {len(lines)}")
+        total_duration = lines[-1].end_time - lines[0].start_time
+        print(f"  ⏱️  Длительность: {total_duration/60:.1f} минут")
+
+        print(f"\n  🔍 Этап 1: Сегментация по паузам...")
+        segments = self.segment_by_pauses(lines)
+
+        if not segments:
+            print("  ✗ Не удалось выделить сегменты")
+            return []
+
+        print(f"\n  🔍 Этап 2: Генерация описаний...")
+        summaries = self.batch_analyze_segments(segments)
+
+        # Формируем итоговые темы
+        topics = []
+        for i, (segment, summary) in enumerate(zip(segments, summaries), 1):
+            topics.append(Topic(
+                number=i,
+                start_time=self._format_time(segment[0].start_time),
+                summary=summary
+            ))
+
+        return topics
+
+    def save_xlsx(self, topics: List[Topic], output_path: Path):
+        """Сохранение в XLSX"""
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
-            writer = csv.DictWriter(f, fieldnames=[
-                'Номер', 'Начало', 'Конец', 'Саммари', 'Полный текст'
-            ], delimiter=';')
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Темы"
 
-            writer.writeheader()
+        # Заголовки
+        headers = ["Время", "Тема/Вопрос"]
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF", size=12)
 
-            for topic in topics:
-                writer.writerow({
-                    'Номер': topic.number,
-                    'Начало': topic.start_time,
-                    'Конец': topic.end_time,
-                    'Саммари': topic.summary.replace('\n', ' '),
-                    'Полный текст': topic.full_text.replace('\n', ' ')
-                })
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(1, col, header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+
+        # Данные
+        for row, topic in enumerate(topics, 2):
+            ws.cell(row, 1, topic.start_time).alignment = Alignment(horizontal='center')
+            ws.cell(row, 2, topic.summary).alignment = Alignment(wrap_text=True, vertical='top')
+
+        # Ширина колонок
+        ws.column_dimensions['A'].width = 12
+        ws.column_dimensions['B'].width = 80
+
+        # Высота строк
+        ws.row_dimensions[1].height = 25
+        for row in range(2, len(topics) + 2):
+            ws.row_dimensions[row].height = 40
+
+        wb.save(output_path)
 
     def process_file(self, input_file: Path) -> Optional[Path]:
         """Обработка файла"""
@@ -533,12 +394,18 @@ class TranscriptAnalyzer:
         print(f"\n  ✅ Итого тем: {len(topics)}")
 
         output_dir = Path(self.config.get('paths', 'output_dir', default='results'))
-        output_path = output_dir / f"{input_file.stem}_analysis.csv"
+        output_path = output_dir / f"{input_file.stem}_topics.xlsx"
 
-        self.save_csv(topics, output_path)
+        self.save_xlsx(topics, output_path)
         print(f"  💾 Сохранено: {output_path}\n")
 
         return output_path
+
+    def _format_time(self, seconds: float) -> str:
+        """Форматирование времени MM:SS"""
+        m = int(seconds // 60)
+        s = int(seconds % 60)
+        return f"{m:02d}:{s:02d}"
 
 
 def main():
@@ -546,37 +413,17 @@ def main():
 
     if len(sys.argv) < 2:
         print("Использование:")
-        print("  python analyzer.py <файл.txt>")
-        print("  python analyzer.py --batch <папка>")
+        print("  python transcript_analyzer.py <файл.txt>")
         return
 
     analyzer = TranscriptAnalyzer("config.yaml")
+    input_file = Path(sys.argv[1])
 
-    if sys.argv[1] == "--batch":
-        input_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path('transcripts')
+    if not input_file.exists():
+        print(f"Ошибка: файл {input_file} не найден")
+        return
 
-        if not input_dir.is_dir():
-            print(f"Ошибка: {input_dir} не является папкой")
-            return
-
-        files = list(input_dir.glob("*.txt"))
-        print(f"Найдено файлов: {len(files)}")
-
-        for file in files:
-            try:
-                analyzer.process_file(file)
-            except Exception as e:
-                print(f"Ошибка при обработке {file.name}: {e}")
-                import traceback
-                traceback.print_exc()
-    else:
-        input_file = Path(sys.argv[1])
-
-        if not input_file.exists():
-            print(f"Ошибка: файл {input_file} не найден")
-            return
-
-        analyzer.process_file(input_file)
+    analyzer.process_file(input_file)
 
 
 if __name__ == "__main__":

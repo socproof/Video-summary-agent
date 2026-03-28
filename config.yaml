@@ -1,6 +1,6 @@
 # config.yaml
 model:
-  name: "mistral"  # Доступные: mistral, llama2, mixtral, gemma, deepseek-r1
+  name: "deepseek-r1"  # Доступные: mistral, deepseek-r1, llama3.1, dolphin-mistral, mixtral
   temperature: 0.1
   num_ctx: 8192
   timeout: 60
